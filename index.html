@@ -12,7 +12,7 @@
     <meta name="apple-mobile-web-app-title" content="Звонки">
     <meta name="theme-color" content="#007AFF">
     
-    <!-- Иконки для iOS -->
+    <!-- Иконки -->
     <link rel="apple-touch-icon" href="https://via.placeholder.com/192/007AFF/FFFFFF?text=📞">
     
     <style>
@@ -188,12 +188,6 @@
             from { transform: translateY(100px); opacity: 0; }
             to { transform: translateY(0); opacity: 1; }
         }
-        
-        .online {
-            color: #34C759;
-            font-size: 12px;
-            margin-left: 5px;
-        }
     </style>
 </head>
 <body>
@@ -253,25 +247,29 @@
         </div>
     </div>
 
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script>
         // =========================================
-        // ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+        // TELEGRAM SIGNAL SERVER
         // =========================================
-        let socket;
+        
+        // 🔴 ВСТАВЬ СВОЙ ТОКЕН СЮДА!
+        const TELEGRAM_BOT_TOKEN = '8547280835:AAF24Mw0S7ixs8W4VBEfdwrmSXSTm02_keg'; // ЗАМЕНИ НА СВОЙ!
+        const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+        
+        // ID чата администратора (куда отправлять сигналы)
+        const ADMIN_CHAT_ID = '123456789'; // ЗАМЕНИ НА СВОЙ!
+        
+        // Хранилище пользователей (номер -> chat_id)
+        const users = {};
+        
+        // Глобальные переменные
         let myPhone = '';
         let peerConnection;
         let localStream;
         let currentCall = null;
         let isMuted = false;
         let isSpeakerOn = false;
-        
-        // =========================================
-        // WebSocket СЕРВЕР (БЕСПЛАТНЫЙ)
-        // =========================================
-        // Используем бесплатный публичный WebSocket сервер для теста
-        // ВАЖНО: Замени на свой сервер когда будет готов!
-        const SOCKET_SERVER = 'https://websocket-demo-server.glitch.me';
+        let updateInterval;
         
         // STUN серверы для WebRTC
         const config = {
@@ -281,98 +279,145 @@
                 { urls: 'stun:stun2.l.google.com:19302' },
                 { urls: 'stun:stun3.l.google.com:19302' },
                 { urls: 'stun:stun4.l.google.com:19302' }
-            ],
-            iceCandidatePoolSize: 10
+            ]
         };
+        
+        // =========================================
+        // TELEGRAM API ФУНКЦИИ
+        // =========================================
+        
+        // Отправка сообщения в Telegram
+        async function sendTelegramMessage(chatId, text) {
+            try {
+                const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        chat_id: chatId,
+                        text: text,
+                        parse_mode: 'HTML'
+                    })
+                });
+                return await response.json();
+            } catch (error) {
+                console.error('Telegram send error:', error);
+            }
+        }
+        
+        // Получение обновлений (проверка входящих сообщений)
+        async function getTelegramUpdates() {
+            try {
+                const response = await fetch(`${TELEGRAM_API}/getUpdates`);
+                const data = await response.json();
+                
+                if (data.ok && data.result) {
+                    data.result.forEach(update => {
+                        if (update.message && update.message.text) {
+                            const chatId = update.message.chat.id;
+                            const text = update.message.text;
+                            
+                            // Обрабатываем команды
+                            if (text.startsWith('/register')) {
+                                const phone = text.split(' ')[1];
+                                if (phone) {
+                                    users[phone] = chatId;
+                                    showToast(`✅ Зарегистрирован: ${phone}`);
+                                    updateUsersList();
+                                }
+                            }
+                            
+                            if (text.startsWith('/call')) {
+                                const to = text.split(' ')[1];
+                                const from = getPhoneByChatId(chatId);
+                                if (to && from && users[to]) {
+                                    sendTelegramMessage(users[to], `/incoming ${from}`);
+                                    sendTelegramMessage(chatId, `🔔 Звоним ${to}...`);
+                                }
+                            }
+                            
+                            if (text.startsWith('/accept')) {
+                                const from = text.split(' ')[1];
+                                if (from && users[from]) {
+                                    sendTelegramMessage(users[from], `/accepted`);
+                                }
+                            }
+                            
+                            if (text.startsWith('/signal')) {
+                                const data = JSON.parse(text.replace('/signal ', ''));
+                                if (data.to && users[data.to]) {
+                                    sendTelegramMessage(users[data.to], `/signal ${JSON.stringify({
+                                        from: getPhoneByChatId(chatId),
+                                        signal: data.signal
+                                    })}`);
+                                }
+                            }
+                            
+                            if (text.startsWith('/end')) {
+                                const to = text.split(' ')[1];
+                                if (to && users[to]) {
+                                    sendTelegramMessage(users[to], `/ended`);
+                                }
+                            }
+                        }
+                    });
+                }
+            } catch (error) {
+                console.error('Telegram getUpdates error:', error);
+            }
+        }
+        
+        // Получить номер телефона по chat_id
+        function getPhoneByChatId(chatId) {
+            for (let phone in users) {
+                if (users[phone] === chatId) {
+                    return phone;
+            }
+        }
+            return null;
+        }
+        
+        // Обновить список пользователей
+        async function updateUsersList() {
+            const userList = Object.keys(users);
+            displayContacts(userList.filter(u => u !== myPhone));
+            
+            // Отправляем всем обновленный список
+            for (let phone in users) {
+                if (phone !== myPhone) {
+                    await sendTelegramMessage(users[phone], `/users ${userList.join(',')}`);
+                }
+            }
+        }
         
         // =========================================
         // РЕГИСТРАЦИЯ
         // =========================================
-        function register() {
-            const phoneInput = document.getElementById('phone-input');
-            myPhone = phoneInput.value.trim();
+        async function register() {
+            myPhone = document.getElementById('phone-input').value.trim();
             
-            if (!myPhone || myPhone.length < 5) {
-                showToast('Введите корректный номер');
+            if (!myPhone) {
+                showToast('Введите номер телефона');
                 return;
             }
             
-            try {
-                socket = io(SOCKET_SERVER, {
-                    transports: ['websocket', 'polling'],
-                    reconnectionAttempts: 5,
-                    timeout: 10000
-                });
-                
-                socket.on('connect', () => {
-                    console.log('✅ Connected to server');
-                    socket.emit('register', myPhone);
-                });
-                
-                socket.on('registered', (data) => {
-                    showToast(`Добро пожаловать, ${myPhone}`);
-                    document.getElementById('register-screen').classList.add('hidden');
-                    document.getElementById('contacts-screen').classList.remove('hidden');
-                    document.getElementById('my-number-badge').textContent = myPhone;
-                });
-                
-                socket.on('users:list', (users) => {
-                    displayContacts(users.filter(u => u !== myPhone));
-                });
-                
-                socket.on('call:incoming', (data) => {
-                    currentCall = { from: data.from };
-                    document.getElementById('caller-number').textContent = data.from;
-                    document.getElementById('incoming-call').classList.remove('hidden');
-                    
-                    if (navigator.vibrate) {
-                        navigator.vibrate([1000, 500, 1000, 500, 1000]);
-                    }
-                });
-                
-                socket.on('call:accepted', async () => {
-                    showToast('Звонок принят');
-                    document.getElementById('call-status-display').textContent = 'Разговор...';
-                });
-                
-                socket.on('call:rejected', () => {
-                    showToast('Звонок отклонен');
-                    endCall();
-                });
-                
-                socket.on('call:ended', () => {
-                    showToast('Звонок завершен');
-                    endCall();
-                });
-                
-                socket.on('signal', async (data) => {
-                    if (!peerConnection) await createPeerConnection();
-                    
-                    try {
-                        if (data.signal.type === 'offer') {
-                            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.signal));
-                            const answer = await peerConnection.createAnswer();
-                            await peerConnection.setLocalDescription(answer);
-                            socket.emit('signal', { to: data.from, signal: peerConnection.localDescription });
-                        } else if (data.signal.type === 'answer') {
-                            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.signal));
-                        } else if (data.signal.candidate) {
-                            await peerConnection.addIceCandidate(new RTCIceCandidate(data.signal));
-                        }
-                    } catch (e) {
-                        console.error('Signal error:', e);
-                    }
-                });
-                
-                socket.on('connect_error', (error) => {
-                    console.error('Connection error:', error);
-                    showToast('Ошибка подключения к серверу');
-                });
-                
-            } catch (error) {
-                console.error('Socket error:', error);
-                showToast('Ошибка инициализации');
-            }
+            // Отправляем команду регистрации в Telegram
+            await sendTelegramMessage(ADMIN_CHAT_ID, `/register ${myPhone}`);
+            
+            // Регистрируем локально
+            users[myPhone] = ADMIN_CHAT_ID;
+            
+            showToast(`Добро пожаловать, ${myPhone}`);
+            document.getElementById('register-screen').classList.add('hidden');
+            document.getElementById('contacts-screen').classList.remove('hidden');
+            document.getElementById('my-number-badge').textContent = myPhone;
+            
+            // Запускаем проверку обновлений
+            updateInterval = setInterval(getTelegramUpdates, 2000);
+            
+            // Обновляем список контактов
+            updateUsersList();
         }
         
         // =========================================
@@ -415,12 +460,12 @@
             try {
                 showToast('Звоним...');
                 
-                localStream = await navigator.mediaDevices.getUserMedia({ 
+                localStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         echoCancellation: true,
                         noiseSuppression: true,
                         autoGainControl: true
-                    } 
+                    }
                 });
                 
                 await createPeerConnection();
@@ -435,8 +480,16 @@
                 
                 await peerConnection.setLocalDescription(offer);
                 
-                socket.emit('call:start', { to, from: myPhone });
-                socket.emit('signal', { to, signal: offer });
+                // Отправляем сигнал через Telegram
+                if (users[to]) {
+                    await sendTelegramMessage(users[to], `/signal ${JSON.stringify({
+                        to: to,
+                        from: myPhone,
+                        signal: peerConnection.localDescription
+                    })}`);
+                    
+                    await sendTelegramMessage(users[to], `/call ${myPhone}`);
+                }
                 
                 currentCall = { to };
                 
@@ -458,11 +511,11 @@
             try {
                 document.getElementById('incoming-call').classList.add('hidden');
                 
-                localStream = await navigator.mediaDevices.getUserMedia({ 
+                localStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         echoCancellation: true,
                         noiseSuppression: true
-                    } 
+                    }
                 });
                 
                 await createPeerConnection();
@@ -471,7 +524,10 @@
                     peerConnection.addTrack(track, localStream);
                 });
                 
-                socket.emit('call:accept', { to: currentCall.from });
+                // Отправляем подтверждение через Telegram
+                if (currentCall && users[currentCall.from]) {
+                    await sendTelegramMessage(users[currentCall.from], `/accept ${myPhone}`);
+                }
                 
                 document.getElementById('contacts-screen').classList.add('hidden');
                 document.getElementById('call-screen').classList.remove('hidden');
@@ -488,8 +544,8 @@
         // ОТКЛОНИТЬ ЗВОНОК
         // =========================================
         function rejectCall() {
-            if (currentCall) {
-                socket.emit('call:reject', { to: currentCall.from });
+            if (currentCall && users[currentCall.from]) {
+                sendTelegramMessage(users[currentCall.from], '/reject');
             }
             document.getElementById('incoming-call').classList.add('hidden');
             currentCall = null;
@@ -509,8 +565,8 @@
                 localStream = null;
             }
             
-            if (currentCall && currentCall.to) {
-                socket.emit('call:end', { to: currentCall.to });
+            if (currentCall && currentCall.to && users[currentCall.to]) {
+                sendTelegramMessage(users[currentCall.to], '/end');
             }
             
             document.getElementById('call-screen').classList.add('hidden');
@@ -530,10 +586,14 @@
             
             peerConnection.onicecandidate = (event) => {
                 if (event.candidate && currentCall) {
-                    socket.emit('signal', {
-                        to: currentCall.to || currentCall.from,
-                        signal: event.candidate
-                    });
+                    const to = currentCall.to || currentCall.from;
+                    if (users[to]) {
+                        sendTelegramMessage(users[to], `/signal ${JSON.stringify({
+                            to: to,
+                            from: myPhone,
+                            signal: event.candidate
+                        })}`);
+                    }
                 }
             };
             
@@ -547,7 +607,6 @@
             };
             
             peerConnection.oniceconnectionstatechange = () => {
-                console.log('ICE state:', peerConnection.iceConnectionState);
                 if (peerConnection.iceConnectionState === 'disconnected' ||
                     peerConnection.iceConnectionState === 'failed' ||
                     peerConnection.iceConnectionState === 'closed') {
@@ -605,7 +664,9 @@
             });
         }
         
-        // Проверка микрофона
+        // =========================================
+        // ПРОВЕРКА МИКРОФОНА
+        // =========================================
         async function checkMicrophone() {
             try {
                 await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -615,6 +676,15 @@
             }
         }
         checkMicrophone();
+        
+        // =========================================
+        // ОЧИСТКА ПРИ ВЫХОДЕ
+        // =========================================
+        window.addEventListener('beforeunload', () => {
+            if (updateInterval) {
+                clearInterval(updateInterval);
+            }
+        });
     </script>
 </body>
 </html>
